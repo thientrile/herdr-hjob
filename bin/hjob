@@ -1,0 +1,6 @@
+#!/bin/sh
+# hjob shim (herdr-hjob plugin): looks up the current install on every run, so plugin updates need no reinstall.
+root=$("${HERDR_BIN_PATH:-herdr}" plugin list --json --plugin thientrile.hjob 2>/dev/null |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["result"]["plugins"][0]["plugin_root"])' 2>/dev/null)
+[ -n "$root" ] || { echo "hjob: plugin thientrile.hjob is not installed in herdr" >&2; exit 127; }
+exec python3 -I "$root/hjob" "$@"
