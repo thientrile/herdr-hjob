@@ -101,9 +101,11 @@ kill $other; rm "$fake/rc.x-rea"
 HERDR_WAKE_BIN="$fake/nowake" "$here/hjob" --name nowake --wait 0 -- "$fake/sleep" 1 | grep -q "not installed" || fail "promised a wake without wake"
 
 # herdr's exit code and a timeout never stop the enqueue: notification is the only herdr call left
-printf '#!/bin/sh\nexit 1\n' > "$fake/herdr"; chmod +x "$fake/herdr"; : > "$fake/calls"
+printf '#!/bin/sh\necho "$*" >> "%s"\nexit 1\n' "$fake/herdr.calls" > "$fake/herdr"; chmod +x "$fake/herdr"; : > "$fake/calls"
 HJOB_DRY_RUN=0 HERDR_BIN_PATH="$fake/herdr" "$here/hjob" --name noherdr --wait 1 -- "$fake/sleep" 2 >/dev/null; done_job noherdr
 grep -q "noherdr" "$fake/calls" || fail "failing herdr blocked the enqueue"
+grep -q '^notification show' "$fake/herdr.calls" && ! grep -qv '^notification show' "$fake/herdr.calls" ||
+  fail "herdr calls other than notification show: $(cat "$fake/herdr.calls")"
 HJOB_DRY_RUN=0 HERDR_BIN_PATH="$fake/missing" "$here/hjob" -- true >/dev/null || fail "missing herdr broke hjob"
 
 # install-cli: installs into an empty dir, refuses to replace a foreign hjob
