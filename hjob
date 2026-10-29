@@ -120,7 +120,7 @@ def tracked(unsettled=False):
 
 
 def retry():
-    """Enqueue every unsettled job whose worker is gone (a live worker retries its own job), within ~10 s per call."""
+    """Enqueue every unsettled job whose worker is gone (a live worker is still making its own first try), within ~10 s per call."""
     deadline = time.time() + 10
     for base, d in tracked(unsettled=True):
         if time.time() > deadline:
@@ -176,19 +176,14 @@ def worker(meta, cmd):
     d = dict(meta, pid=os.getpid())
     if not os.path.exists(base + ".detached"):  # the caller vanished before deciding: track the job anyway
         json.dump(d, open(base + ".detached", "w"))
-    ok = enqueue(base, d) in (0, 2)
+    enqueue(base, d)  # one try: if it stores nothing, the next hjob call or herdr start retries it
     verdict = "done" if code == 0 else f"FAILED (exit {code})"
     herdr("notification", "show", f"{meta['name']}: {verdict} in {secs}s", "--sound", "done" if code == 0 else "request")
     if os.environ.get("HJOB_NOTIFY_CMD") and not DRY:  # optional extra channel, e.g. a Telegram script
-        try:  # a broken notifier must not stop the agent wake-up below
+        try:  # a broken notifier must not crash the worker
             subprocess.run([os.environ["HJOB_NOTIFY_CMD"], f"Job {meta['name']}: {verdict} in {secs}s"], capture_output=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired):
             pass
-    for delay in (30, 60, 120, 240):  # wake may be restarting: keep trying a while; once this worker exits, retry() takes over
-        if ok:
-            break
-        time.sleep(delay)
-        ok = enqueue(base, d) in (0, 2)
 
 
 def main():

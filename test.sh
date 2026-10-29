@@ -45,8 +45,7 @@ grep -q SECRETOUTPUT "$fake/calls" && fail "command output passed to wake"
 rm "$base.enqueued"  # finished while nothing enqueued it (worker died after writing the result): the next call does
 "$here/hjob" status >/dev/null; [ "$(calls)" = 2 ] && [ -f "$base.enqueued" ] || fail "finished job not enqueued on the next call"
 
-# exit 1 and a missing wake binary store nothing: the worker retries while it lives (a call meanwhile leaves the job alone),
-# then the next hjob call does
+# exit 1 and a missing wake binary store nothing: the worker tries once, then the next hjob call retries
 for bad in rc1 missing; do
   : > "$fake/calls"; echo 1 > "$fake/rc"
   [ $bad = missing ] && export HERDR_WAKE_BIN="$fake/nowake"
@@ -55,8 +54,7 @@ for bad in rc1 missing; do
   [ -f "$base.enqueued" ] && fail "$bad: marked enqueued"
   "$here/hjob" status | grep -q "${base##*/}  NOT ENQUEUED" || fail "$bad: failed enqueue not visible in hjob status"
   export HERDR_WAKE_BIN="$fake/wake"; echo 0 > "$fake/rc"; : > "$fake/calls"
-  "$here/hjob" -- true >/dev/null; [ "$(calls)" = 0 ] || fail "$bad: retried while its worker still owns it"
-  kill "$(pid_of "$base")"; sleep 0.3
+  pid=$(pid_of "$base"); for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
   "$here/hjob" -- true >/dev/null
   grep -qx -- "job_done" "$fake/calls" && [ -f "$base.enqueued" ] || fail "$bad: not retried on the next call"
 done
@@ -81,9 +79,10 @@ grep -qx job_failed "$fake/calls" && grep -q "lost its hjob worker" "$fake/calls
 "$here/hjob" status "${base##*/}" | grep -q "worker died" || fail "status of a dead worker's job says it is running"
 pkill -f "$fake/sleep 30" || true
 
-# dead workers: a pid reused by another process is not the worker; an exit-1 job does not block newer ones;
+# dead workers: a pid reused by another process is not the worker (Linux only: elsewhere alive() trusts the pid, so use a dead one); an exit-1 job does not block newer ones;
 # malformed state files never crash hjob
 : > "$fake/calls"; "$fake/sleep" 20 & other=$!
+[ -d /proc/self ] || { kill $other; wait $other 2>/dev/null || true; }
 for n in a b; do
   echo "{\"name\": \"re$n\", \"log\": \"$st/x-re$n.log\", \"pane\": \"\", \"cwd\": \"$HOME\", \"pid\": $other}" > "$st/x-re$n.detached"
   : > "$st/x-re$n.log"
@@ -95,7 +94,7 @@ grep -qx x-reb "$fake/calls" && [ -f "$st/x-reb.enqueued" ] || fail "reused pid 
 [ -f "$st/x-rea.enqueue-retry" ] || fail "exit-1 job not marked for retry"
 "$here/hjob" status x-reb | grep -q "worker died" || fail "status of a reused-pid job"
 "$here/hjob" status | grep -q "x-bad" && fail "malformed job listed"
-kill $other; rm "$fake/rc.x-rea"
+kill $other 2>/dev/null || true; rm "$fake/rc.x-rea"
 
 # no wake binary: the detach message does not promise a wake-up
 HERDR_WAKE_BIN="$fake/nowake" "$here/hjob" --name nowake --wait 0 -- "$fake/sleep" 1 | grep -q "not installed" || fail "promised a wake without wake"
