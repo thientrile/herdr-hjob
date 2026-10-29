@@ -2,8 +2,12 @@ id = "thientrile.hjob"
 name = "hjob"
 version = "0.1.0"
 min_herdr_version = "0.9.1"
-description = "Run long commands in the background; herdr notifies you and wakes the agent pane with the exit code and log path."
+description = "Run long commands in the background; herdr notifies you and herdr-wake wakes the agent with the exit code."
 platforms = ["linux", "macos"]
+
+# after a herdr restart: enqueue jobs that ended while nothing could hand them to herdr-wake
+[[startup]]
+command = ["python3", "-I", "hjob", "status"]
 
 [[actions]]
 id = "install-cli"
