@@ -6,13 +6,14 @@ export HOME=$(mktemp -d) HJOB_DRY_RUN=1 HERDR_PANE_ID=test-pane
 trap 'pkill -f "$HOME/" 2>/dev/null || true; rm -rf "$HOME"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 st="$HOME/.local/state/hjob" fake="$HOME/fake"; mkdir -p "$fake"
-# fake wake: logs its argv one per line (calls separated by ---), exits with the code in $fake/rc
+# fake wake: logs its argv one per line (calls separated by ---), exits with the code in $fake/rc.<id>, else $fake/rc
 cat > "$fake/wake" <<FAKE
 #!/bin/sh
 printf '%s\n' "\$@" --- >> "$fake/calls"
-echo '{"status":"enqueued"}'; exit "\$(cat "$fake/rc")"
+echo '{"status":"enqueued"}'; exit "\$(cat "$fake/rc.\$5" 2>/dev/null || cat "$fake/rc")"
 FAKE
 chmod +x "$fake/wake"; echo 0 > "$fake/rc"; export HERDR_WAKE_BIN="$fake/wake"
+pid_of() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["pid"])' "$1.detached"; }
 calls() { grep -c -- '^---$' "$fake/calls" 2>/dev/null || true; }
 done_job() { for _ in $(seq 50); do ls "$st"/*"$1".enqueue* >/dev/null 2>&1 && break; sleep 0.2; done; }  # the worker's first enqueue settled
 ln -s "$(command -v sleep)" "$fake/sleep"  # jobs sleep via $HOME, so the trap's pkill reaches every worker and command
@@ -44,7 +45,8 @@ grep -q SECRETOUTPUT "$fake/calls" && fail "command output passed to wake"
 rm "$base.enqueued"  # finished while nothing enqueued it (worker died after writing the result): the next call does
 "$here/hjob" status >/dev/null; [ "$(calls)" = 2 ] && [ -f "$base.enqueued" ] || fail "finished job not enqueued on the next call"
 
-# exit 1 and a missing wake binary store nothing: the next hjob call retries
+# exit 1 and a missing wake binary store nothing: the worker retries while it lives (a call meanwhile leaves the job alone),
+# then the next hjob call does
 for bad in rc1 missing; do
   : > "$fake/calls"; echo 1 > "$fake/rc"
   [ $bad = missing ] && export HERDR_WAKE_BIN="$fake/nowake"
@@ -52,7 +54,9 @@ for bad in rc1 missing; do
   base=$(ls "$st"/*$bad.log); base=${base%.log}
   [ -f "$base.enqueued" ] && fail "$bad: marked enqueued"
   "$here/hjob" status | grep -q "${base##*/}  NOT ENQUEUED" || fail "$bad: failed enqueue not visible in hjob status"
-  export HERDR_WAKE_BIN="$fake/wake"; echo 0 > "$fake/rc"
+  export HERDR_WAKE_BIN="$fake/wake"; echo 0 > "$fake/rc"; : > "$fake/calls"
+  "$here/hjob" -- true >/dev/null; [ "$(calls)" = 0 ] || fail "$bad: retried while its worker still owns it"
+  kill "$(pid_of "$base")"; sleep 0.3
   "$here/hjob" -- true >/dev/null
   grep -qx -- "job_done" "$fake/calls" && [ -f "$base.enqueued" ] || fail "$bad: not retried on the next call"
 done
@@ -71,11 +75,27 @@ echo 0 > "$fake/rc"; "$here/hjob" -- true >/dev/null
 "$here/hjob" --name dead --wait 1 -- "$fake/sleep" 30 >/dev/null
 base=$(ls "$st"/*dead.log); base=${base%.log}
 "$here/hjob" -- true >/dev/null; [ "$(calls)" = 0 ] || fail "running job enqueued"
-kill "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["pid"])' "$base.detached")"; sleep 0.5
+kill "$(pid_of "$base")"; sleep 0.5
 "$here/hjob" -- true >/dev/null
 grep -qx job_failed "$fake/calls" && grep -q "lost its hjob worker" "$fake/calls" && [ -f "$base.enqueued" ] || fail "dead worker not enqueued"
 "$here/hjob" status "${base##*/}" | grep -q "worker died" || fail "status of a dead worker's job says it is running"
 pkill -f "$fake/sleep 30" || true
+
+# dead workers: a pid reused by another process is not the worker; an exit-1 job does not block newer ones;
+# malformed state files never crash hjob
+: > "$fake/calls"; "$fake/sleep" 20 & other=$!
+for n in a b; do
+  echo "{\"name\": \"re$n\", \"log\": \"$st/x-re$n.log\", \"pane\": \"\", \"cwd\": \"$HOME\", \"pid\": $other}" > "$st/x-re$n.detached"
+  : > "$st/x-re$n.log"
+done
+echo 1 > "$fake/rc.x-rea"
+echo '{"pid": 1, "name": "bad", "cwd": "/", "pane": null}' > "$st/x-bad1.detached"; echo null > "$st/x-bad2.detached"
+"$here/hjob" -- true >/dev/null || fail "malformed state broke hjob"
+grep -qx x-reb "$fake/calls" && [ -f "$st/x-reb.enqueued" ] || fail "reused pid hid a dead worker, or an exit-1 job blocked a newer one"
+[ -f "$st/x-rea.enqueue-retry" ] || fail "exit-1 job not marked for retry"
+"$here/hjob" status x-reb | grep -q "worker died" || fail "status of a reused-pid job"
+"$here/hjob" status | grep -q "x-bad" && fail "malformed job listed"
+kill $other; rm "$fake/rc.x-rea"
 
 # no wake binary: the detach message does not promise a wake-up
 HERDR_WAKE_BIN="$fake/nowake" "$here/hjob" --name nowake --wait 0 -- "$fake/sleep" 1 | grep -q "not installed" || fail "promised a wake without wake"

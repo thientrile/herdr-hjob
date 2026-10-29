@@ -11,7 +11,7 @@ exit code, time) to `wake enqueue` (herdr-wake), which prompts the agent working
 directory once it is idle, and herdr shows a notification. Nothing from the command's output
 is ever put in that line. Every hjob call retries jobs whose enqueue failed.
 """
-import glob, json, os, re, shutil, subprocess, sys, time
+import glob, json, os, re, shutil, subprocess, sys, tempfile, time
 
 STATE = os.path.expanduser("~/.local/state/hjob")
 HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
@@ -53,9 +53,10 @@ def alive(pid):
     """True while pid is an hjob worker; on Linux a pid reused by another process (e.g. after a reboot) is not."""
     if os.path.isdir("/proc/self"):
         try:
-            return b"--worker" in open(f"/proc/{pid}/cmdline", "rb").read()
+            args = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
         except OSError:
             return False
+        return args[3:4] == [b"--worker"] and os.path.basename(args[2]) == b"hjob"  # python -I .../hjob --worker
     try:  # shortcut: macOS has no /proc, so a reused pid reads as alive and delays job_failed; upgrade if seen
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -65,27 +66,42 @@ def alive(pid):
     return True
 
 
+def load(path, need):
+    """The JSON object at path if it has every key in need with the given type, else None."""
+    try:
+        d = json.load(open(path))
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) and all(isinstance(d.get(k), t) for k, t in need.items()) else None
+
+
+DETACHED = {"pid": int, "name": str, "cwd": str, "pane": str}  # .detached: the job's meta plus its worker pid
+RESULT = {"exit": int}  # .json: written by the worker when the command ends
+
+
 def enqueue(base, d):
     """Hand a detached job that ended (or whose worker died) to herdr-wake and record how that went.
 
     .enqueued: stored (or duplicate); .enqueue-error: wake rejected the call (exit 2), a bug, not retried;
-    .enqueue-retry: nothing stored (exit 1, missing wake, timeout), retried later. Returns wake's exit code, -1 if it did not run."""
-    job = os.path.basename(base)
-    try:
-        r = json.load(open(base + ".json"))
-        kind, text = "job_done" if r["exit"] == 0 else "job_failed", f"job '{d['name']}' finished with exit {r['exit']} in {r['seconds']}s"
-    except (OSError, ValueError, KeyError):  # no (complete) result: the worker died before writing it
+    .enqueue-retry: nothing stored (exit 1, missing wake, timeout). Returns wake's exit code, None if it did not run."""
+    job, r = os.path.basename(base), load(base + ".json", RESULT)
+    if r:
+        kind, text = "job_done" if r["exit"] == 0 else "job_failed", f"job '{d['name']}' finished with exit {r['exit']} in {r.get('seconds', '?')}s"
+    else:  # no (complete) result: the worker died before writing it
         kind, text = "job_failed", f"job '{d['name']}' lost its hjob worker, no result recorded; the command may still be running"
     cmd = [WAKE, "enqueue", "--source", "hjob", "--id", job, "--cwd", d["cwd"], "--kind", kind, "--text", text,
            "--hint", f"hjob status {job}"] + (["--pane-hint", d["pane"]] if d["pane"] else [])
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
-        code, msg = p.returncode, (p.stdout + p.stderr).strip()
-    except (OSError, subprocess.TimeoutExpired) as e:
-        code, msg = -1, f"{type(e).__name__}: {e}"
+    with tempfile.TemporaryFile("w+") as out:  # a file, not a pipe: a child of wake holding the pipe cannot outlast the timeout
+        try:
+            code = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=10).returncode
+        except (OSError, subprocess.TimeoutExpired) as e:
+            code = None
+            out.write(f"{type(e).__name__}: {e}")
+        out.seek(0)
+        msg = out.read(300).strip()
     mark = {0: ".enqueued", 2: ".enqueue-error"}.get(code, ".enqueue-retry")
     with open(base + mark, "w") as f:
-        f.write(f"{time.strftime('%FT%T')} exit {code}: {msg[:300]}\n")
+        f.write(f"{time.strftime('%FT%T')} exit {code}: {msg}\n")
     if code in (0, 2) and os.path.exists(base + ".enqueue-retry"):
         os.remove(base + ".enqueue-retry")
     return code
@@ -98,21 +114,19 @@ def settled(base):
 def tracked(unsettled=False):
     """(base, detach record) of the detached jobs this hjob version tracks, oldest first."""
     for f in sorted(glob.glob(f"{STATE}/*.detached")):
-        if unsettled and settled(f[:-9]):
-            continue
-        try:
-            d = json.load(open(f))
-        except (OSError, ValueError):
-            continue  # an older hjob left an empty marker: not tracked
-        if isinstance(d, dict) and isinstance(d.get("pid"), int) and {"name", "cwd", "pane"} <= d.keys():
+        d = None if unsettled and settled(f[:-9]) else load(f, DETACHED)
+        if d:  # an older hjob left an empty marker: not tracked
             yield f[:-9], d
 
 
 def retry():
-    """Enqueue jobs whose worker is gone, or whose worker's enqueue failed, until one is settled."""
+    """Enqueue every unsettled job whose worker is gone (a live worker retries its own job), within ~10 s per call."""
+    deadline = time.time() + 10
     for base, d in tracked(unsettled=True):
-        if (not alive(d["pid"]) or os.path.exists(base + ".enqueue-retry")) and enqueue(base, d) == -1:
-            return  # wake missing or hanging: the rest would fail too, each after its timeout
+        if time.time() > deadline:
+            return
+        if not alive(d["pid"]) and enqueue(base, d) is None:
+            return  # wake missing or hanging: the rest would fail the same way
 
 
 def wake_state(base):
@@ -120,7 +134,10 @@ def wake_state(base):
                         (".enqueue-retry", "NOT ENQUEUED, retried on the next hjob call")):
         if os.path.exists(base + mark):
             return f"{label} ({open(base + mark).read().strip()})"
-    return "running" if not os.path.exists(base + ".json") else "finished, not enqueued yet"
+    d = load(base + ".detached", DETACHED)
+    if d and alive(d["pid"]):
+        return "running"
+    return "finished, not enqueued yet" if load(base + ".json", RESULT) else "its hjob worker died, not enqueued yet"
 
 
 def status(job):
@@ -136,17 +153,10 @@ def status(job):
 
 
 def summary(log):
-    base = log[:-4]
-    try:
-        code = json.load(open(base + ".json"))["exit"]
-    except (OSError, ValueError, KeyError):
-        code = None
-    try:
-        dead = code is None and not alive(json.load(open(base + ".detached"))["pid"])
-    except (OSError, ValueError, KeyError, TypeError):
-        dead = False
-    end = f"exit {code}" if code is not None else "no result: its hjob worker died" if dead else "still running"
-    print(digest(log, -1 if code is None else code) + f"\n[hjob] {end}")
+    base, r = log[:-4], load(log[:-4] + ".json", RESULT)
+    d = None if r else load(base + ".detached", DETACHED)
+    end = f"exit {r['exit']}" if r else "no result: its hjob worker died" if d and not alive(d["pid"]) else "still running"
+    print(digest(log, r["exit"] if r else -1) + f"\n[hjob] {end}")
 
 
 def worker(meta, cmd):
@@ -163,9 +173,9 @@ def worker(meta, cmd):
         if os.path.exists(base + ".detached"):
             break
         time.sleep(0.1)
-    if not os.path.exists(base + ".detached"):  # the caller vanished before deciding: track the job anyway
-        json.dump(dict(meta, pid=os.getpid()), open(base + ".detached", "w"))
     d = dict(meta, pid=os.getpid())
+    if not os.path.exists(base + ".detached"):  # the caller vanished before deciding: track the job anyway
+        json.dump(d, open(base + ".detached", "w"))
     ok = enqueue(base, d) in (0, 2)
     verdict = "done" if code == 0 else f"FAILED (exit {code})"
     herdr("notification", "show", f"{meta['name']}: {verdict} in {secs}s", "--sound", "done" if code == 0 else "request")
@@ -174,8 +184,8 @@ def worker(meta, cmd):
             subprocess.run([os.environ["HJOB_NOTIFY_CMD"], f"Job {meta['name']}: {verdict} in {secs}s"], capture_output=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired):
             pass
-    for delay in (30, 60, 120, 240):  # wake may be restarting: keep trying a while, then hjob calls and herdr start take over
-        if ok or settled(base):
+    for delay in (30, 60, 120, 240):  # wake may be restarting: keep trying a while; once this worker exits, retry() takes over
+        if ok:
             break
         time.sleep(delay)
         ok = enqueue(base, d) in (0, 2)
@@ -186,7 +196,7 @@ def main():
     if argv[:1] != ["--worker"] and os.path.isdir(STATE):
         try:  # jobs whose enqueue failed earlier, or that ended while nothing was watching
             retry()
-        except OSError as e:  # best effort: never stop the user's command
+        except Exception as e:  # best effort over state files on disk: never stop the user's command
             print(f"[hjob] retrying wake enqueues failed: {e}", file=sys.stderr)
     if argv[:1] == ["status"] and len(argv) <= 2:
         return status(argv[1] if len(argv) == 2 else "")
